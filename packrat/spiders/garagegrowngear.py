@@ -2,6 +2,7 @@ import scrapy
 import json
 import re
 from urllib.parse import urljoin
+from w3lib.html import remove_tags
 
 class GarageGrownGearSpider(scrapy.Spider):
     name = "garagegrowngear"
@@ -16,7 +17,6 @@ class GarageGrownGearSpider(scrapy.Spider):
     def parse(self, response):
         product_links = response.css("a.product-item__title::attr(href)").getall()
         seen_urls = set()
-
         for href in product_links:
             full_url = urljoin(response.url, href)
             if full_url not in seen_urls:
@@ -24,7 +24,6 @@ class GarageGrownGearSpider(scrapy.Spider):
                 yield response.follow(full_url, callback=self.parse_detail)
 
     def parse_detail(self, response):
-        # Try to get the product title from h1 or og:title meta tag
         title = response.css("h1.product__title::text").get()
         if not title:
             title = response.css("meta[property='og:title']::attr(content)").get()
@@ -43,47 +42,61 @@ class GarageGrownGearSpider(scrapy.Spider):
 
             meta_json = match.group(1)
             meta = json.loads(meta_json)
-            variants = meta.get("product", {}).get("variants", [])
+            product = meta.get("product", {})
+            variants = product.get("variants", [])
+            images = product.get("images", [])
+            description = product.get("description")
+            brand = product.get("vendor")
+            category = product.get("type")
+            product_id = product.get("id")
+            tags = product.get("tags", [])
+            options = product.get("options", [])
 
-            seen_ids = set()
-            for variant in variants:
-                variant_id = variant.get("id")
-                if variant_id in seen_ids:
-                    continue
-                seen_ids.add(variant_id)
+            # Fallback for images if empty
+            if not images:
+                images = response.css("img.product__media-img::attr(src)").getall()
+                images = [response.urljoin(img) for img in images]
 
-                variant_title = variant.get("public_title") or "Default"
-                price_cents = variant.get("price")
+            # Clean description (remove HTML tags if needed)
+            if description:
+                description = remove_tags(description).strip()
 
-                if price_cents is not None:
-                    price = f"${int(price_cents) / 100:.2f}"
-                else:
-                    html_price = response.css("span.price-item--regular::text").get()
-                    if html_price is not None:
-                        html_price = html_price.strip()
-                        if html_price.lower().startswith("from"):
-                            # Always get the minimum price from all variants
-                            all_prices = [v.get("price") for v in variants if v.get("price") is not None]
-                            if all_prices:
-                                min_price = min(all_prices)
-                                price = f"${int(min_price) / 100:.2f}"
-                            else:
-                                price = "N/A"
-                        else:
-                            price = html_price
-                    else:
-                        price = "N/A"
+            # Build variants list
+            variants_list = []
+            for v in variants:
+                variants_list.append({
+                    "id": v.get("id"),
+                    "title": v.get("public_title") or "Default",
+                    "price": f"${int(v.get('price')) / 100:.2f}" if v.get("price") else None,
+                    "available": v.get("available")
+                })
 
-                # Safely handle None for title and variant_title
-                safe_title = title.strip() if title else "No Title"
-                safe_variant_title = variant_title.strip() if variant_title else "Default"
+            # Main price (lowest variant price)
+            prices = [int(v.get("price")) for v in variants if v.get("price")]
+            main_price = f"${min(prices)/100:.2f}" if prices else None
 
-                # Only yield if price is not "From"
-                if price and price.lower() != "from":
-                    yield {
-                        "productName": f"{safe_title} - {safe_variant_title}",
-                        "price": price,
-                        "url": url
-                    }
+            # Attributes: add tags, options, or other site-specific fields
+            attributes = {}
+            if tags:
+                attributes["tags"] = tags
+            if options:
+                attributes["options"] = options
+
+            yield {
+                "id": product_id,
+                "name": title,
+                "brand": brand,
+                "category": category,
+                "price": main_price,
+                "currency": "USD",
+                "url": url,
+                "images": images,
+                "description": description,
+                "attributes": attributes,
+                "variants": variants_list,
+                "availability": "In Stock" if any(v.get("available") for v in variants) else "Out of Stock",
+                "extra": {}
+            }
+
         except Exception as e:
-            self.logger.error(f"❌ Error parsing variant prices for {url}: {e}")
+            self.logger.error(f"❌ Error parsing product details for {url}: {e}")
