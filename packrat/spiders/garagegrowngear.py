@@ -1,102 +1,91 @@
 import scrapy
-import json
 import re
 from urllib.parse import urljoin
-from w3lib.html import remove_tags
+
 
 class GarageGrownGearSpider(scrapy.Spider):
     name = "garagegrowngear"
+    allowed_domains = ["garagegrowngear.com"]
+    start_urls = ["https://www.garagegrowngear.com/collections/all?page=1"]
+
     custom_settings = {
-        "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "DOWNLOAD_DELAY": 5,
-        "CONCURRENT_REQUESTS": 1,
+        "DOWNLOAD_DELAY": 1.5,
+        "FEED_EXPORT_ENCODING": "utf-8",
         "ROBOTSTXT_OBEY": False,
+        "CONCURRENT_REQUESTS": 2,
+        "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     }
-    start_urls = ["https://www.garagegrowngear.com/collections/all"]
 
     def parse(self, response):
-        product_links = response.css("a.product-item__title::attr(href)").getall()
-        seen_urls = set()
-        for href in product_links:
-            full_url = urljoin(response.url, href)
-            if full_url not in seen_urls:
-                seen_urls.add(full_url)
-                yield response.follow(full_url, callback=self.parse_detail)
+        # Get all product links
+        links = response.css("a.product-item__title::attr(href)").getall()
+        for link in links:
+            full_url = response.urljoin(link)
+            yield scrapy.Request(full_url, callback=self.parse_product)
 
-    def parse_detail(self, response):
-        title = response.css("h1.product__title::text").get()
-        if not title:
-            title = response.css("meta[property='og:title']::attr(content)").get()
-        url = response.url
+        # Pagination
+        next_page = response.css('a[title="Next"]::attr(href)').get()
+        if next_page:
+            yield response.follow(next_page, callback=self.parse)
 
-        script_text = response.xpath('//script[contains(text(), "var meta =")]/text()').get()
-        if not script_text:
-            self.logger.warning(f"❌ No meta script found on: {url}")
-            return
+    def parse_product(self, response):
+        # Product name fallback using og:title
+        name = response.css("h1.product__title::text").get()
+        if not name:
+            name = response.css("meta[property='og:title']::attr(content)").get()
+        if name:
+            name = name.strip()
 
-        try:
-            match = re.search(r'var meta\s*=\s*(\{.*?\});', script_text, re.DOTALL)
-            if not match:
-                self.logger.warning(f"⚠️ meta JSON not found in script for: {url}")
-                return
+        product_url = response.url
 
-            meta_json = match.group(1)
-            meta = json.loads(meta_json)
-            product = meta.get("product", {})
-            variants = product.get("variants", [])
-            images = product.get("images", [])
-            description = product.get("description")
-            brand = product.get("vendor")
-            category = product.get("type")
-            product_id = product.get("id")
-            tags = product.get("tags", [])
-            options = product.get("options", [])
+        # Categories from breadcrumb (skip 'Home')
+        categories = response.css("nav.breadcrumb a::text").getall()
+        categories = [c.strip() for c in categories if c.strip().lower() != "home"]
+        if not categories:
+            categories = ["All"]
 
-            # Fallback for images if empty
-            if not images:
-                images = response.css("img.product__media-img::attr(src)").getall()
-                images = [response.urljoin(img) for img in images]
+        # Images
+        images = response.css("img.product__media-img::attr(src)").getall()
+        if not images:
+            images = response.css("meta[property='og:image']::attr(content)").getall()
+        images = [response.urljoin(img.strip()) for img in images if img.strip()]
 
-            # Clean description (remove HTML tags if needed)
-            if description:
-                description = remove_tags(description).strip()
+        # Price
+        price_text = response.css("span.price::text").get()
+        price = price_text.strip().replace(" ", "") if price_text else None
 
-            # Build variants list
-            variants_list = []
-            for v in variants:
-                variants_list.append({
-                    "id": v.get("id"),
-                    "title": v.get("public_title") or "Default",
-                    "price": f"${int(v.get('price')) / 100:.2f}" if v.get("price") else None,
-                    "available": v.get("available")
+        # Variants
+        variants = []
+        variant_options = response.css("select#ProductSelect-product-template option")
+        if variant_options:
+            for opt in variant_options:
+                title = opt.css("::text").get(default="").strip()
+                price_match = re.search(r"\$[\d.,]+", title)
+                variant_price = price_match.group() if price_match else price
+                variants.append({
+                    "title": title.replace(variant_price, "").replace(" - ", "").strip() or "Default",
+                    "price": variant_price,
+                    "available": "sold out" not in title.lower()
                 })
+        else:
+            variants = [{
+                "title": "Default",
+                "price": price,
+                "available": True
+            }]
 
-            # Main price (lowest variant price)
-            prices = [int(v.get("price")) for v in variants if v.get("price")]
-            main_price = f"${min(prices)/100:.2f}" if prices else None
+        availability = "In Stock" if any(v["available"] for v in variants) else "Out of Stock"
 
-            # Attributes: add tags, options, or other site-specific fields
-            attributes = {}
-            if tags:
-                attributes["tags"] = tags
-            if options:
-                attributes["options"] = options
-
-            yield {
-                "id": product_id,
-                "name": title,
-                "brand": brand,
-                "category": category,
-                "price": main_price,
-                "currency": "USD",
-                "url": url,
-                "images": images,
-                "description": description,
-                "attributes": attributes,
-                "variants": variants_list,
-                "availability": "In Stock" if any(v.get("available") for v in variants) else "Out of Stock",
-                "extra": {}
-            }
-
-        except Exception as e:
-            self.logger.error(f"❌ Error parsing product details for {url}: {e}")
+        yield {
+            "name": name or "",
+            "productUrl": product_url,
+            "categories": categories,
+            "images": images,
+            "price": price,
+            "variants": variants,
+            "techSpecs": [],
+            "weight": "1",
+            "weightUnit": "g",
+            "reviewCount": 0,
+            "availability": availability
+        }
